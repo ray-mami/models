@@ -46,6 +46,7 @@ from official.datasets import movielens
 from official.recommendation import constants as rconst
 from official.recommendation import stat_utils
 from official.recommendation import popen_helper
+from official.utils.logs import mlperf_helper
 
 
 DATASET_TO_NUM_USERS_AND_ITEMS = {
@@ -57,7 +58,7 @@ DATASET_TO_NUM_USERS_AND_ITEMS = {
 # Number of batches to run per epoch when using synthetic data. At high batch
 # sizes, we run for more batches than with real data, which is good since
 # running more batches reduces noise when measuring the average batches/second.
-_SYNTHETIC_BATCHES_PER_EPOCH = 2000
+SYNTHETIC_BATCHES_PER_EPOCH = 2000
 
 
 class NCFDataset(object):
@@ -65,7 +66,7 @@ class NCFDataset(object):
 
   def __init__(self, user_map, item_map, num_data_readers, cache_paths,
                num_train_positives, deterministic=False):
-    # type: (dict, dict, int, rconst.Paths) -> None
+    # type: (dict, dict, int, rconst.Paths, int, bool) -> None
     """Assign key values for recommendation dataset.
 
     Args:
@@ -134,6 +135,9 @@ def _filter_index_sort(raw_rating_path, match_mlperf):
   original_users = df[movielens.USER_COLUMN].unique()
   original_items = df[movielens.ITEM_COLUMN].unique()
 
+  mlperf_helper.ncf_print(key=mlperf_helper.TAGS.PREPROC_HP_MIN_RATINGS,
+                          value=rconst.MIN_NUM_RATINGS)
+
   # Map the ids of user and item to 0 based index for following processing
   tf.logging.info("Generating user_map and item_map...")
   user_map = {user: index for index, user in enumerate(original_users)}
@@ -146,6 +150,12 @@ def _filter_index_sort(raw_rating_path, match_mlperf):
 
   num_users = len(original_users)
   num_items = len(original_items)
+
+  mlperf_helper.ncf_print(key=mlperf_helper.TAGS.PREPROC_HP_NUM_EVAL,
+                          value=rconst.NUM_EVAL_NEGATIVES)
+  mlperf_helper.ncf_print(
+      key=mlperf_helper.TAGS.PREPROC_HP_SAMPLE_EVAL_REPLACEMENT,
+      value=match_mlperf)
 
   assert num_users <= np.iinfo(np.int32).max
   assert num_items <= np.iinfo(np.uint16).max
@@ -175,7 +185,6 @@ def _filter_index_sort(raw_rating_path, match_mlperf):
 
 
 def _train_eval_map_fn(args):
-  # type: (...) -> typing.Dict(np.ndarray)
   """Split training and testing data and generate testing negatives.
 
   This function is called as part of a multiprocessing map. The principle
@@ -186,9 +195,8 @@ def _train_eval_map_fn(args):
 
   For each user, all but the last item is written into a pickle file which the
   training data producer can consume on as needed. The last item for a user
-  is a validation point; for each validation point a number of negatives are
-  generated (typically 999). The validation data is returned by this function,
-  as it is held in memory for the remainder of the run.
+  is a validation point; it is written under a separate key and will be used
+  later to generate the evaluation data.
 
   Args:
     shard: A dict containing the user and item arrays.
@@ -198,16 +206,10 @@ def _train_eval_map_fn(args):
       which validation negatives should be drawn.
     cache_paths: rconst.Paths object containing locations for various cache
       files.
-    seed: Random seed to be used when generating testing negatives.
-    match_mlperf: If True, sample eval negative with replacements, which the
-      MLPerf reference implementation does.
 
-  Returns:
-    A dict containing the evaluation data for a given shard.
   """
 
-  shard, shard_id, num_items, cache_paths, seed, match_mlperf = args
-  np.random.seed(seed)
+  shard, shard_id, num_items, cache_paths = args
 
   users = shard[movielens.USER_COLUMN]
   items = shard[movielens.ITEM_COLUMN]
@@ -218,7 +220,6 @@ def _train_eval_map_fn(args):
                 [users.shape[0]])
 
   train_blocks = []
-  test_blocks = []
   test_positives = []
   for i in range(len(boundaries) - 1):
     # This is simply a vector of repeated values such that the shard could be
@@ -233,38 +234,30 @@ def _train_eval_map_fn(args):
 
     block_items = items[boundaries[i]:boundaries[i+1]]
     train_blocks.append((block_user[:-1], block_items[:-1]))
-
-    test_negatives = stat_utils.sample_with_exclusion(
-        num_items=num_items, positive_set=set(block_items),
-        n=rconst.NUM_EVAL_NEGATIVES, replacement=match_mlperf)
-    test_blocks.append((
-        block_user[0] * np.ones((rconst.NUM_EVAL_NEGATIVES + 1,),
-                                dtype=np.int32),
-        np.array([block_items[-1]] + test_negatives, dtype=np.uint16)
-    ))
     test_positives.append((block_user[0], block_items[-1]))
 
   train_users = np.concatenate([i[0] for i in train_blocks])
   train_items = np.concatenate([i[1] for i in train_blocks])
+
+  test_pos_users = np.array([i[0] for i in test_positives],
+                            dtype=train_users.dtype)
+  test_pos_items = np.array([i[1] for i in test_positives],
+                            dtype=train_items.dtype)
 
   train_shard_fpath = cache_paths.train_shard_template.format(
       str(shard_id).zfill(5))
 
   with tf.gfile.Open(train_shard_fpath, "wb") as f:
     pickle.dump({
-        movielens.USER_COLUMN: train_users,
-        movielens.ITEM_COLUMN: train_items,
+        rconst.TRAIN_KEY: {
+            movielens.USER_COLUMN: train_users,
+            movielens.ITEM_COLUMN: train_items,
+        },
+        rconst.EVAL_KEY: {
+            movielens.USER_COLUMN: test_pos_users,
+            movielens.ITEM_COLUMN: test_pos_items,
+        }
     }, f)
-
-  test_users = np.concatenate([i[0] for i in test_blocks])
-  test_items = np.concatenate([i[1] for i in test_blocks])
-  assert test_users.shape == test_items.shape
-  assert test_items.shape[0] % (rconst.NUM_EVAL_NEGATIVES + 1) == 0
-
-  return {
-      movielens.USER_COLUMN: test_users,
-      movielens.ITEM_COLUMN: test_items,
-  }
 
 
 def generate_train_eval_data(df, approx_num_shards, num_items, cache_paths,
@@ -327,38 +320,16 @@ def generate_train_eval_data(df, approx_num_shards, num_items, cache_paths,
                   "negatives per user...".format(rconst.NUM_EVAL_NEGATIVES))
   tf.gfile.MakeDirs(cache_paths.train_shard_subdir)
 
-  # We choose a different random seed for each process, so that the processes
-  # will not all choose the same random numbers.
-  process_seeds = [np.random.randint(2**32) for _ in range(approx_num_shards)]
-  map_args = [(shards[i], i, num_items, cache_paths, process_seeds[i],
-               match_mlperf)
+  map_args = [(shards[i], i, num_items, cache_paths)
               for i in range(approx_num_shards)]
+
   with popen_helper.get_pool(multiprocessing.cpu_count()) as pool:
-    test_shards = pool.map(_train_eval_map_fn, map_args)  # pylint: disable=no-member
-
-  tf.logging.info("Merging test shards...")
-  test_users = np.concatenate([i[movielens.USER_COLUMN] for i in test_shards])
-  test_items = np.concatenate([i[movielens.ITEM_COLUMN] for i in test_shards])
-
-  assert test_users.shape == test_items.shape
-  assert test_items.shape[0] % (rconst.NUM_EVAL_NEGATIVES + 1) == 0
-
-  test_labels = np.zeros(shape=test_users.shape)
-  test_labels[0::(rconst.NUM_EVAL_NEGATIVES + 1)] = 1
-  eval_data = ({
-      movielens.USER_COLUMN: test_users,
-      movielens.ITEM_COLUMN: test_items,
-  }, test_labels)
-
-  tf.logging.info("Writing test data to file.")
-  tf.gfile.MakeDirs(cache_paths.eval_data_subdir)
-  with tf.gfile.Open(cache_paths.eval_raw_file, "wb") as f:
-    pickle.dump(eval_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    pool.map(_train_eval_map_fn, map_args)  # pylint: disable=no-member
 
 
 def construct_cache(dataset, data_dir, num_data_readers, match_mlperf,
                     deterministic, cache_id=None):
-  # type: (str, str, int, bool, typing.Optional[int]) -> NCFDataset
+  # type: (str, str, int, bool, bool, typing.Optional[int]) -> NCFDataset
   """Load and digest data CSV into a usable form.
 
   Args:
@@ -420,27 +391,55 @@ def _shutdown(proc):
 
   tf.logging.info("Shutting down train data creation subprocess.")
   try:
-    proc.send_signal(signal.SIGINT)
+    try:
+      proc.send_signal(signal.SIGINT)
+      time.sleep(5)
+      if proc.poll() is not None:
+        tf.logging.info("Train data creation subprocess ended")
+        return  # SIGINT was handled successfully within 5 seconds
+
+    except socket.error:
+      pass
+
+    # Otherwise another second of grace period and then force kill the process.
     time.sleep(1)
-    if proc.returncode is not None:
-      return  # SIGINT was handled successfully within 1 sec
+    proc.terminate()
+    tf.logging.info("Train data creation subprocess killed")
+  except:  # pylint: disable=broad-except
+    tf.logging.error("Data generation subprocess could not be killed.")
 
-  except socket.error:
-    pass
 
-  # Otherwise another second of grace period and then forcibly kill the process.
-  time.sleep(1)
-  proc.terminate()
 
+def write_flagfile(flags_, ncf_dataset):
+  """Write flagfile to begin async data generation."""
+  if ncf_dataset.deterministic:
+    flags_["seed"] = stat_utils.random_int32()
+
+  # We write to a temp file then atomically rename it to the final file,
+  # because writing directly to the final file can cause the data generation
+  # async process to read a partially written JSON file.
+  flagfile_temp = os.path.join(ncf_dataset.cache_paths.cache_root,
+                               rconst.FLAGFILE_TEMP)
+  tf.logging.info("Preparing flagfile for async data generation in {} ..."
+                  .format(flagfile_temp))
+  with tf.gfile.Open(flagfile_temp, "w") as f:
+    for k, v in six.iteritems(flags_):
+      f.write("--{}={}\n".format(k, v))
+  flagfile = os.path.join(ncf_dataset.cache_paths.cache_root, rconst.FLAGFILE)
+  tf.gfile.Rename(flagfile_temp, flagfile)
+  tf.logging.info(
+      "Wrote flagfile for async data generation in {}.".format(flagfile))
 
 def instantiate_pipeline(dataset, data_dir, batch_size, eval_batch_size,
-                         num_data_readers=None, num_neg=4, epochs_per_cycle=1,
-                         match_mlperf=False, deterministic=False,
-                         use_subprocess=True, cache_id=None):
+                         num_cycles, num_data_readers=None, num_neg=4,
+                         epochs_per_cycle=1, match_mlperf=False,
+                         deterministic=False, use_subprocess=True,
+                         cache_id=None):
   # type: (...) -> (NCFDataset, typing.Callable)
   """Preprocess data and start negative generation subprocess."""
 
   tf.logging.info("Beginning data preprocessing.")
+  tf.gfile.MakeDirs(data_dir)
   ncf_dataset = construct_cache(dataset=dataset, data_dir=data_dir,
                                 num_data_readers=num_data_readers,
                                 match_mlperf=match_mlperf,
@@ -456,36 +455,18 @@ def instantiate_pipeline(dataset, data_dir, batch_size, eval_batch_size,
       "num_neg": num_neg,
       "num_train_positives": ncf_dataset.num_train_positives,
       "num_items": ncf_dataset.num_items,
+      "num_users": ncf_dataset.num_users,
       "num_readers": ncf_dataset.num_data_readers,
       "epochs_per_cycle": epochs_per_cycle,
+      "num_cycles": num_cycles,
       "train_batch_size": batch_size,
       "eval_batch_size": eval_batch_size,
       "num_workers": num_workers,
-      # This allows the training input function to guarantee batch size and
-      # significantly improves performance. (~5% increase in examples/sec on
-      # GPU, and needed for TPU XLA.)
-      "spillover": True,
       "redirect_logs": use_subprocess,
       "use_tf_logging": not use_subprocess,
+      "ml_perf": match_mlperf,
+      "output_ml_perf_compliance_logging": mlperf_helper.LOGGER.enabled,
   }
-  if ncf_dataset.deterministic:
-    flags_["seed"] = stat_utils.random_int32()
-  tf.gfile.MakeDirs(data_dir)
-  # We write to a temp file then atomically rename it to the final file,
-  # because writing directly to the final file can cause the data generation
-  # async process to read a partially written JSON file.
-  flagfile_temp = os.path.join(ncf_dataset.cache_paths.cache_root,
-                               rconst.FLAGFILE_TEMP)
-  tf.logging.info("Preparing flagfile for async data generation in {} ..."
-                  .format(flagfile_temp))
-  with tf.gfile.Open(flagfile_temp, "w") as f:
-    for k, v in six.iteritems(flags_):
-      f.write("--{}={}\n".format(k, v))
-  flagfile = os.path.join(ncf_dataset.cache_paths.cache_root, rconst.FLAGFILE)
-  tf.gfile.Rename(flagfile_temp, flagfile)
-  tf.logging.info(
-      "Wrote flagfile for async data generation in {}."
-      .format(flagfile))
 
   if use_subprocess:
     tf.logging.info("Creating training file subprocess.")
@@ -526,6 +507,15 @@ def instantiate_pipeline(dataset, data_dir, batch_size, eval_batch_size,
     raise ValueError("Generation subprocess did not start correctly. Data will "
                      "not be available; exiting to avoid waiting forever.")
 
+  # We start the async process and wait for it to signal that it is alive. It
+  # will then enter a loop waiting for the flagfile to be written. Once we see
+  # that the async process has signaled that it is alive, we clear the system
+  # caches and begin the run.
+  mlperf_helper.ncf_print(key=mlperf_helper.TAGS.RUN_CLEAR_CACHES)
+  mlperf_helper.clear_system_caches()
+  mlperf_helper.ncf_print(key=mlperf_helper.TAGS.RUN_START)
+  write_flagfile(flags_, ncf_dataset)
+
   return ncf_dataset, cleanup
 
 
@@ -548,8 +538,8 @@ def make_deserialize(params, batch_size, training=False):
     items = tf.reshape(tf.decode_raw(
         features[movielens.ITEM_COLUMN], tf.uint16), (batch_size,))
 
-    if params["use_tpu"]:
-      items = tf.cast(items, tf.int32)  # TPU doesn't allow uint16 infeed.
+    if params["use_tpu"] or params["use_xla_for_gpu"]:
+      items = tf.cast(items, tf.int32)  # TPU and XLA disallows uint16 infeed.
 
     if not training:
       dupe_mask = tf.reshape(tf.cast(tf.decode_raw(
@@ -608,64 +598,48 @@ def hash_pipeline(dataset, deterministic):
   tf.logging.info("  [pipeline_hash] All batches hash: {}".format(overall_hash))
 
 
-def make_train_input_fn(ncf_dataset):
-  # type: (typing.Optional[NCFDataset]) -> (typing.Callable, str, int)
+def make_input_fn(
+    ncf_dataset,       # type: typing.Optional[NCFDataset]
+    is_training,       # type: bool
+    record_files=None  # type: typing.Optional[tf.Tensor]
+    ):
+  # type: (...) -> (typing.Callable, str, int)
   """Construct training input_fn for the current epoch."""
 
   if ncf_dataset is None:
-    return make_train_synthetic_input_fn()
+    return make_synthetic_input_fn(is_training)
 
-  if not tf.gfile.Exists(ncf_dataset.cache_paths.subproc_alive):
-    # The generation subprocess must have been alive at some point, because we
-    # earlier checked that the subproc_alive file existed.
-    raise ValueError("Generation subprocess unexpectedly died. Data will not "
-                     "be available; exiting to avoid waiting forever.")
+  if record_files is not None:
+    epoch_metadata = None
+    batch_count = None
+    record_dir = None
+  else:
+    epoch_metadata, record_dir, template = get_epoch_info(is_training,
+                                                          ncf_dataset)
+    record_files = os.path.join(record_dir, template.format("*"))
+    # This value is used to check that the batch count from the subprocess
+    # matches the batch count expected by the main thread.
+    batch_count = epoch_metadata["batch_count"]
 
-  train_epoch_dir = ncf_dataset.cache_paths.train_epoch_dir
-  while not tf.gfile.Exists(train_epoch_dir):
-    tf.logging.info("Waiting for {} to exist.".format(train_epoch_dir))
-    time.sleep(1)
-
-  train_data_dirs = tf.gfile.ListDirectory(train_epoch_dir)
-  while not train_data_dirs:
-    tf.logging.info("Waiting for data folder to be created.")
-    time.sleep(1)
-    train_data_dirs = tf.gfile.ListDirectory(train_epoch_dir)
-  train_data_dirs.sort()  # names are zfilled so that
-                          # lexicographic sort == numeric sort
-  record_dir = os.path.join(train_epoch_dir, train_data_dirs[0])
-
-  ready_file = os.path.join(record_dir, rconst.READY_FILE)
-  while not tf.gfile.Exists(ready_file):
-    tf.logging.info("Waiting for records in {} to be ready".format(record_dir))
-    time.sleep(1)
-
-  with tf.gfile.Open(ready_file, "r") as f:
-    epoch_metadata = json.load(f)
-
-  # The data pipeline uses spillover to guarantee static batch sizes. This
-  # means that an extra batch will need to be run every few epochs. TPUs
-  # require that the number of batches to be run is known at the time that
-  # estimator.train() is called, so having the generation pipeline report
-  # number of batches guarantees that this count is correct.
-  batch_count = epoch_metadata["batch_count"]
 
   def input_fn(params):
     """Generated input_fn for the given epoch."""
-    batch_size = params["batch_size"]
+    if is_training:
+      batch_size = params["batch_size"]
+    else:
+      # Estimator has "eval_batch_size" included in the params, but TPUEstimator
+      # populates "batch_size" to the appropriate value.
+      batch_size = params.get("eval_batch_size") or params["batch_size"]
 
-    if epoch_metadata["batch_size"] != batch_size:
+    if epoch_metadata and epoch_metadata["batch_size"] != batch_size:
       raise ValueError(
           "Records were constructed with batch size {}, but input_fn was given "
           "a batch size of {}. This will result in a deserialization error in "
           "tf.parse_single_example."
           .format(epoch_metadata["batch_size"], batch_size))
+    record_files_ds = tf.data.Dataset.list_files(record_files, shuffle=False)
 
-    record_files = tf.data.Dataset.list_files(
-        os.path.join(record_dir, rconst.TRAIN_RECORD_TEMPLATE.format("*")),
-        shuffle=False)
-
-    interleave = tf.contrib.data.parallel_interleave(
+    interleave = tf.data.experimental.parallel_interleave(
         tf.data.TFRecordDataset,
         cycle_length=4,
         block_length=100000,
@@ -673,8 +647,8 @@ def make_train_input_fn(ncf_dataset):
         prefetch_input_elements=4,
     )
 
-    deserialize = make_deserialize(params, batch_size, True)
-    dataset = record_files.apply(interleave)
+    deserialize = make_deserialize(params, batch_size, is_training)
+    dataset = record_files_ds.apply(interleave)
     dataset = dataset.map(deserialize, num_parallel_calls=4)
     dataset = dataset.prefetch(32)
 
@@ -686,11 +660,67 @@ def make_train_input_fn(ncf_dataset):
   return input_fn, record_dir, batch_count
 
 
-def make_train_synthetic_input_fn():
+def _check_subprocess_alive(ncf_dataset, directory):
+  if (not tf.gfile.Exists(ncf_dataset.cache_paths.subproc_alive) and
+      not tf.gfile.Exists(directory)):
+    # The generation subprocess must have been alive at some point, because we
+    # earlier checked that the subproc_alive file existed.
+    raise ValueError("Generation subprocess unexpectedly died. Data will not "
+                     "be available; exiting to avoid waiting forever.")
+
+
+
+def get_epoch_info(is_training, ncf_dataset):
+  """Wait for the epoch input data to be ready and return various info about it.
+
+  Args:
+    is_training: If we should return info for a training or eval epoch.
+    ncf_dataset: An NCFDataset.
+
+  Returns:
+    epoch_metadata: A dict with epoch metadata.
+    record_dir: The directory with the TFRecord files storing the input data.
+    template: A string template of the files in `record_dir`.
+      `template.format('*')` is a glob that matches all the record files.
+  """
+  if is_training:
+    train_epoch_dir = ncf_dataset.cache_paths.train_epoch_dir
+    _check_subprocess_alive(ncf_dataset, train_epoch_dir)
+
+    while not tf.gfile.Exists(train_epoch_dir):
+      tf.logging.info("Waiting for {} to exist.".format(train_epoch_dir))
+      time.sleep(1)
+
+    train_data_dirs = tf.gfile.ListDirectory(train_epoch_dir)
+    while not train_data_dirs:
+      tf.logging.info("Waiting for data folder to be created.")
+      time.sleep(1)
+      train_data_dirs = tf.gfile.ListDirectory(train_epoch_dir)
+    train_data_dirs.sort()  # names are zfilled so that
+                            # lexicographic sort == numeric sort
+    record_dir = os.path.join(train_epoch_dir, train_data_dirs[0])
+    template = rconst.TRAIN_RECORD_TEMPLATE
+  else:
+    record_dir = ncf_dataset.cache_paths.eval_data_subdir
+    _check_subprocess_alive(ncf_dataset, record_dir)
+    template = rconst.EVAL_RECORD_TEMPLATE
+
+  ready_file = os.path.join(record_dir, rconst.READY_FILE)
+  while not tf.gfile.Exists(ready_file):
+    tf.logging.info("Waiting for records in {} to be ready".format(record_dir))
+    time.sleep(1)
+
+  with tf.gfile.Open(ready_file, "r") as f:
+    epoch_metadata = json.load(f)
+  return epoch_metadata, record_dir, template
+
+
+def make_synthetic_input_fn(is_training):
   """Construct training input_fn that uses synthetic data."""
   def input_fn(params):
     """Generated input_fn for the given epoch."""
-    batch_size = params["batch_size"]
+    batch_size = (params["batch_size"] if is_training else
+                  params["eval_batch_size"] or params["batch_size"])
     num_users = params["num_users"]
     num_items = params["num_items"]
 
@@ -698,78 +728,26 @@ def make_train_synthetic_input_fn():
                               maxval=num_users)
     items = tf.random_uniform([batch_size], dtype=tf.int32, minval=0,
                               maxval=num_items)
-    labels = tf.random_uniform([batch_size], dtype=tf.int32, minval=0,
-                               maxval=2)
 
-    data = {
-        movielens.USER_COLUMN: users,
-        movielens.ITEM_COLUMN: items,
-    }, labels
+    if is_training:
+      labels = tf.random_uniform([batch_size], dtype=tf.int32, minval=0,
+                                 maxval=2)
+      data = {
+          movielens.USER_COLUMN: users,
+          movielens.ITEM_COLUMN: items,
+      }, labels
+    else:
+      dupe_mask = tf.cast(tf.random_uniform([batch_size], dtype=tf.int32,
+                                            minval=0, maxval=2), tf.bool)
+      data = {
+          movielens.USER_COLUMN: users,
+          movielens.ITEM_COLUMN: items,
+          rconst.DUPLICATE_MASK: dupe_mask,
+      }
+
     dataset = tf.data.Dataset.from_tensors(data).repeat(
-        _SYNTHETIC_BATCHES_PER_EPOCH)
+        SYNTHETIC_BATCHES_PER_EPOCH)
     dataset = dataset.prefetch(32)
     return dataset
 
-  return input_fn, None, _SYNTHETIC_BATCHES_PER_EPOCH
-
-
-def make_pred_input_fn(ncf_dataset):
-  # type: (typing.Optional[NCFDataset]) -> typing.Callable
-  """Construct input_fn for metric evaluation."""
-
-  if ncf_dataset is None:
-    return make_synthetic_pred_input_fn()
-
-  def input_fn(params):
-    """Input function based on eval batch size."""
-
-    # Estimator has "eval_batch_size" included in the params, but TPUEstimator
-    # populates "batch_size" to the appropriate value.
-    batch_size = params.get("eval_batch_size") or params["batch_size"]
-    record_file = ncf_dataset.cache_paths.eval_record_template.format(
-        batch_size)
-    while not tf.gfile.Exists(record_file):
-      tf.logging.info(
-          "Waiting for eval data to be written to {}".format(record_file))
-      time.sleep(1)
-    dataset = tf.data.TFRecordDataset(record_file)
-
-    deserialize = make_deserialize(params, batch_size, False)
-    dataset = dataset.map(deserialize, num_parallel_calls=4)
-    dataset = dataset.prefetch(16)
-
-    if params.get("hash_pipeline"):
-      hash_pipeline(dataset, ncf_dataset.deterministic)
-
-    return dataset
-
-  return input_fn
-
-
-def make_synthetic_pred_input_fn():
-  """Construct input_fn for metric evaluation that uses synthetic data."""
-
-  def input_fn(params):
-    """Generated input_fn for the given epoch."""
-    batch_size = params["eval_batch_size"]
-    num_users = params["num_users"]
-    num_items = params["num_items"]
-
-    users = tf.random_uniform([batch_size], dtype=tf.int32, minval=0,
-                              maxval=num_users)
-    items = tf.random_uniform([batch_size], dtype=tf.int32, minval=0,
-                              maxval=num_items)
-    dupe_mask = tf.cast(tf.random_uniform([batch_size], dtype=tf.int32,
-                                          minval=0, maxval=2), tf.bool)
-
-    data = {
-        movielens.USER_COLUMN: users,
-        movielens.ITEM_COLUMN: items,
-        rconst.DUPLICATE_MASK: dupe_mask,
-    }
-    dataset = tf.data.Dataset.from_tensors(data).repeat(
-        _SYNTHETIC_BATCHES_PER_EPOCH)
-    dataset = dataset.prefetch(16)
-    return dataset
-
-  return input_fn
+  return input_fn, None, SYNTHETIC_BATCHES_PER_EPOCH
