@@ -45,7 +45,7 @@ from official.recommendation import stat_utils
 from official.utils.logs import mlperf_helper
 
 
-def _sparse_to_dense_grads(grads_and_vars):
+def sparse_to_dense_grads(grads_and_vars):
   """Convert sparse gradients to dense gradients.
 
   All sparse gradients, which are represented as instances of tf.IndexedSlices,
@@ -135,7 +135,7 @@ def neumf_model_fn(features, labels, mode, params):
     tvars = tf.compat.v1.trainable_variables()
     gradients = optimizer.compute_gradients(
         loss, tvars, colocate_gradients_with_ops=True)
-    gradients = _sparse_to_dense_grads(gradients)
+    gradients = sparse_to_dense_grads(gradients)
     minimize_op = optimizer.apply_gradients(
         gradients, global_step=global_step, name="train")
     update_ops = tf.compat.v1.get_collection(tf.compat.v1.GraphKeys.UPDATE_OPS)
@@ -427,8 +427,9 @@ def compute_top_k_and_ndcg(logits,              # type: tf.Tensor
     (num_users_in_batch, (rconst.NUM_EVAL_NEGATIVES + 1)).
   """
   logits_by_user = tf.reshape(logits, (-1, rconst.NUM_EVAL_NEGATIVES + 1))
-  duplicate_mask_by_user = tf.reshape(duplicate_mask,
-                                      (-1, rconst.NUM_EVAL_NEGATIVES + 1))
+  duplicate_mask_by_user = tf.cast(
+      tf.reshape(duplicate_mask, (-1, rconst.NUM_EVAL_NEGATIVES + 1)),
+      tf.float32)
 
   if match_mlperf:
     # Set duplicate logits to the min value for that dtype. The MLPerf
