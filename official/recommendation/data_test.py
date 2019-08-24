@@ -109,6 +109,7 @@ class BaseTest(tf.test.TestCase):
         "match_mlperf": True,
         "use_tpu": False,
         "use_xla_for_gpu": False,
+        "stream_files": False,
     }
 
   def test_preprocessing(self):
@@ -167,8 +168,11 @@ class BaseTest(tf.test.TestCase):
     md5 = hashlib.md5()
     for features, labels in first_epoch:
       data_list = [
-          features[movielens.USER_COLUMN], features[movielens.ITEM_COLUMN],
-          features[rconst.VALID_POINT_MASK], labels]
+          features[movielens.USER_COLUMN].flatten(),
+          features[movielens.ITEM_COLUMN].flatten(),
+          features[rconst.VALID_POINT_MASK].flatten(),
+          labels.flatten()
+      ]
       for i in data_list:
         md5.update(i.tobytes())
 
@@ -215,8 +219,10 @@ class BaseTest(tf.test.TestCase):
     md5 = hashlib.md5()
     for features in eval_data:
       data_list = [
-          features[movielens.USER_COLUMN], features[movielens.ITEM_COLUMN],
-          features[rconst.DUPLICATE_MASK]]
+          features[movielens.USER_COLUMN].flatten(),
+          features[movielens.ITEM_COLUMN].flatten(),
+          features[rconst.DUPLICATE_MASK].flatten()
+      ]
       for i in data_list:
         md5.update(i.tobytes())
 
@@ -275,8 +281,11 @@ class BaseTest(tf.test.TestCase):
     md5 = hashlib.md5()
     for features, labels in results:
       data_list = [
-          features[movielens.USER_COLUMN], features[movielens.ITEM_COLUMN],
-          features[rconst.VALID_POINT_MASK], labels]
+          features[movielens.USER_COLUMN].flatten(),
+          features[movielens.ITEM_COLUMN].flatten(),
+          features[rconst.VALID_POINT_MASK].flatten(),
+          labels.flatten()
+      ]
       for i in data_list:
         md5.update(i.tobytes())
 

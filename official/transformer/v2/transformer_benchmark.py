@@ -21,6 +21,7 @@ import os
 import time
 
 from absl import flags
+import tensorflow as tf
 
 from official.transformer.v2 import misc
 from official.transformer.v2 import transformer_main as transformer_main
@@ -30,6 +31,7 @@ from official.utils.testing.perfzero_benchmark import PerfZeroBenchmark
 TRANSFORMER_EN2DE_DATA_DIR_NAME = 'wmt32k-en2de-official'
 EN2DE_2014_BLEU_DATA_DIR_NAME = 'newstest2014'
 FLAGS = flags.FLAGS
+TMP_DIR = os.getenv('TMPDIR')
 
 
 class TransformerBenchmark(PerfZeroBenchmark):
@@ -55,6 +57,11 @@ class TransformerBenchmark(PerfZeroBenchmark):
     self.bleu_ref = os.path.join(root_data_dir,
                                  EN2DE_2014_BLEU_DATA_DIR_NAME,
                                  'newstest2014.de')
+
+    if default_flags is None:
+      default_flags = {}
+    default_flags['data_dir'] = self.train_data_dir
+    default_flags['vocab_file'] = self.vocab_file
 
     super(TransformerBenchmark, self).__init__(
         output_dir=output_dir,
@@ -83,10 +90,22 @@ class TransformerBenchmark(PerfZeroBenchmark):
 
     metrics = []
     if 'bleu_uncased' in stats:
-      metrics.append({'name': 'bleu_uncased',
-                      'value': stats['bleu_uncased'],
-                      'min_value': bleu_min,
-                      'max_value': bleu_max})
+      if 'bleu_uncased_history' in stats:
+        bleu_uncased_best = max(stats['bleu_uncased_history'],
+                                key=lambda x: x[1])
+        metrics.append({'name': 'bleu_uncased',
+                        'value': bleu_uncased_best[1],
+                        'min_value': bleu_min,
+                        'max_value': bleu_max})
+        metrics.append({'name': 'bleu_best_score_iteration',
+                        'value': bleu_uncased_best[0]})
+        metrics.append({'name': 'bleu_uncased_last',
+                        'value': stats['bleu_uncased']})
+      else:
+        metrics.append({'name': 'bleu_uncased',
+                        'value': stats['bleu_uncased'],
+                        'min_value': bleu_min,
+                        'max_value': bleu_max})
 
     if (warmup and 'step_timestamp_log' in stats and
         len(stats['step_timestamp_log']) > warmup):
@@ -142,9 +161,9 @@ class TransformerBaseKerasAccuracy(TransformerBenchmark):
     FLAGS['bleu_source'].value = self.bleu_source
     FLAGS['bleu_ref'].value = self.bleu_ref
     FLAGS.param_set = 'base'
-    FLAGS.batch_size = 4096
-    FLAGS.train_steps = 100000
-    FLAGS.steps_between_evals = 5000
+    FLAGS.batch_size = 2048
+    FLAGS.train_steps = 1000
+    FLAGS.steps_between_evals = 500
     FLAGS.model_dir = self._get_model_dir('benchmark_1_gpu')
     # These bleu scores are based on test runs after at this limited
     # number of steps and batch size after verifying SOTA at 8xV100s.
@@ -249,7 +268,10 @@ class TransformerBigKerasAccuracy(TransformerBenchmark):
   def benchmark_8_gpu(self):
     """Benchmark 8 gpu.
 
-      Should converge to 28.4 BLEU (uncased). This has not be verified yet."
+    Over 6 runs with eval every 20K steps the average highest value was 28.195
+    (bleu uncased). 28.424 was the highest and 27.96 the lowest. The values are
+    the highest value seen during a run and occurred at a median of iteration 9.
+    Iterations are not epochs, an iteration is a number of steps between evals.
     """
     self._setup()
     FLAGS.num_gpus = 8
@@ -260,18 +282,18 @@ class TransformerBigKerasAccuracy(TransformerBenchmark):
     FLAGS['bleu_ref'].value = self.bleu_ref
     FLAGS.param_set = 'big'
     FLAGS.batch_size = 3072*8
-    FLAGS.train_steps = 400000
+    FLAGS.train_steps = 20000 * 12
     FLAGS.steps_between_evals = 20000
     FLAGS.model_dir = self._get_model_dir('benchmark_8_gpu')
     self._run_and_report_benchmark(total_batch_size=FLAGS.batch_size,
                                    log_steps=FLAGS.log_steps,
-                                   bleu_min=28,
-                                   bleu_max=29)
+                                   bleu_min=27.9,
+                                   bleu_max=29.2)
 
   def benchmark_8_gpu_static_batch(self):
     """Benchmark 8 gpu.
 
-      Should converge to 28.4 BLEU (uncased). This has not be verified yet."
+    Should converge to 28.4 BLEU (uncased). This has not be verified yet."
     """
     self._setup()
     FLAGS.num_gpus = 8
@@ -284,13 +306,43 @@ class TransformerBigKerasAccuracy(TransformerBenchmark):
     FLAGS.batch_size = 3072*8
     FLAGS.static_batch = True
     FLAGS.max_length = 64
-    FLAGS.train_steps = 400000
+    FLAGS.train_steps = 20000 * 12
     FLAGS.steps_between_evals = 20000
     FLAGS.model_dir = self._get_model_dir('benchmark_8_gpu_static_batch')
     self._run_and_report_benchmark(total_batch_size=FLAGS.batch_size,
                                    log_steps=FLAGS.log_steps,
                                    bleu_min=28,
-                                   bleu_max=29)
+                                   bleu_max=29.2)
+
+  def benchmark_8_gpu_fp16(self):
+    """Benchmark 8 gpu with dynamic batch and fp16.
+
+    Over 6 runs with eval every 20K steps the average highest value was 28.247
+    (bleu uncased). 28.424 was the highest and 28.09 the lowest. The values are
+    the highest value seen during a run and occurred at a median of iteration
+    11. While this could be interpreted as worse than FP32, if looking at the
+    first iteration at which 28 is passed FP16 performs equal and possibly
+    better. Although not part of the initial test runs, the highest value
+    recorded with the arguments below was 28.9 at iteration 12. Iterations are
+    not epochs, an iteration is a number of steps between evals.
+    """
+    self._setup()
+    FLAGS.num_gpus = 8
+    FLAGS.dtype = 'fp16'
+    FLAGS.data_dir = self.train_data_dir
+    FLAGS.vocab_file = self.vocab_file
+    # Sets values directly to avoid validation check.
+    FLAGS['bleu_source'].value = self.bleu_source
+    FLAGS['bleu_ref'].value = self.bleu_ref
+    FLAGS.param_set = 'big'
+    FLAGS.batch_size = 3072*8
+    FLAGS.train_steps = 20000 * 12
+    FLAGS.steps_between_evals = 20000
+    FLAGS.model_dir = self._get_model_dir('benchmark_8_gpu_fp16')
+    self._run_and_report_benchmark(total_batch_size=FLAGS.batch_size,
+                                   log_steps=FLAGS.log_steps,
+                                   bleu_min=28,
+                                   bleu_max=29.2)
 
   def benchmark_8_gpu_static_batch_fp16(self):
     """Benchmark 8 gpu with static batch and fp16.
@@ -315,7 +367,7 @@ class TransformerBigKerasAccuracy(TransformerBenchmark):
     self._run_and_report_benchmark(total_batch_size=FLAGS.batch_size,
                                    log_steps=FLAGS.log_steps,
                                    bleu_min=28,
-                                   bleu_max=29)
+                                   bleu_max=29.2)
 
   def benchmark_xla_8_gpu_static_batch_fp16(self):
     """Benchmark 8 gpu with static batch, XLA, and FP16.
@@ -342,7 +394,7 @@ class TransformerBigKerasAccuracy(TransformerBenchmark):
     self._run_and_report_benchmark(total_batch_size=FLAGS.batch_size,
                                    log_steps=FLAGS.log_steps,
                                    bleu_min=28,
-                                   bleu_max=29)
+                                   bleu_max=29.2)
 
 
 class TransformerKerasBenchmark(TransformerBenchmark):
@@ -573,17 +625,9 @@ class TransformerKerasBenchmark(TransformerBenchmark):
 class TransformerBaseKerasBenchmarkReal(TransformerKerasBenchmark):
   """Transformer based version real data benchmark tests."""
 
-  def __init__(self, output_dir=None, root_data_dir=None, **kwargs):
-    train_data_dir = os.path.join(root_data_dir,
-                                  TRANSFORMER_EN2DE_DATA_DIR_NAME)
-    vocab_file = os.path.join(root_data_dir,
-                              TRANSFORMER_EN2DE_DATA_DIR_NAME,
-                              'vocab.ende.32768')
-
+  def __init__(self, output_dir=TMP_DIR, root_data_dir=None, **kwargs):
     def_flags = {}
     def_flags['param_set'] = 'base'
-    def_flags['vocab_file'] = vocab_file
-    def_flags['data_dir'] = train_data_dir
     def_flags['train_steps'] = 200
     def_flags['log_steps'] = 10
 
@@ -595,20 +639,16 @@ class TransformerBaseKerasBenchmarkReal(TransformerKerasBenchmark):
 class TransformerBigKerasBenchmarkReal(TransformerKerasBenchmark):
   """Transformer based version real data benchmark tests."""
 
-  def __init__(self, output_dir=None, root_data_dir=None, **kwargs):
-    train_data_dir = os.path.join(root_data_dir,
-                                  TRANSFORMER_EN2DE_DATA_DIR_NAME)
-    vocab_file = os.path.join(root_data_dir,
-                              TRANSFORMER_EN2DE_DATA_DIR_NAME,
-                              'vocab.ende.32768')
-
+  def __init__(self, output_dir=TMP_DIR, root_data_dir=None, **kwargs):
     def_flags = {}
     def_flags['param_set'] = 'big'
-    def_flags['vocab_file'] = vocab_file
-    def_flags['data_dir'] = train_data_dir
     def_flags['train_steps'] = 200
     def_flags['log_steps'] = 10
 
     super(TransformerBigKerasBenchmarkReal, self).__init__(
         output_dir=output_dir, default_flags=def_flags,
         root_data_dir=root_data_dir, batch_per_gpu=3072)
+
+
+if __name__ == '__main__':
+  tf.test.main()

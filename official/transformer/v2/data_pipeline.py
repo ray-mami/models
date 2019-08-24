@@ -268,12 +268,12 @@ def _generate_synthetic_data(params):
   dataset = model_helpers.generate_synthetic_data(
       input_shape=tf.TensorShape([length]),
       input_value=1,
-      input_dtype=tf.int32,
+      input_dtype=tf.int64,
       label_shape=tf.TensorShape([length]),
       label_value=1,
-      label_dtype=tf.int32,
+      label_dtype=tf.int64,
   )
-  return dataset.batch(batch)
+  return dataset.batch(batch, drop_remainder=True)
 
 
 def train_input_fn(params):

@@ -53,15 +53,16 @@ def get_loss_scale(flags_obj, default_for_fp16):
     return default_for_fp16
 
 
-def define_performance(num_parallel_calls=True, inter_op=True, intra_op=True,
-                       synthetic_data=True, max_train_steps=True, dtype=True,
+def define_performance(num_parallel_calls=False, inter_op=False, intra_op=False,
+                       synthetic_data=True, max_train_steps=False, dtype=True,
                        all_reduce_alg=True, num_packs=True,
                        tf_gpu_thread_mode=False,
                        datasets_num_private_threads=False,
                        datasets_num_parallel_batches=False,
                        dynamic_loss_scale=False, fp16_implementation=False,
                        loss_scale=False,
-                       tf_data_experimental_slack=False, enable_xla=False):
+                       tf_data_experimental_slack=False, enable_xla=False,
+                       force_v2_in_keras_compile=False):
   """Register flags for specifying performance tuning arguments.
 
   Args:
@@ -87,6 +88,9 @@ def define_performance(num_parallel_calls=True, inter_op=True, intra_op=True,
     tf_data_experimental_slack: Determines whether to enable tf.data's
       `experimental_slack` option.
     enable_xla: Determines if XLA (auto clustering) is turned on.
+    force_v2_in_keras_compile: Forces the use of run_distribued path even if not
+      using a `strategy`. This is not the same as
+      `tf.distribute.OneDeviceStrategy`
 
   Returns:
     A list of flags for core.py to marks as key flags.
@@ -275,5 +279,12 @@ def define_performance(num_parallel_calls=True, inter_op=True, intra_op=True,
     flags.DEFINE_boolean(
         name="enable_xla", default=False,
         help="Whether to enable XLA auto jit compilation")
+
+  if force_v2_in_keras_compile:
+    flags.DEFINE_boolean(
+        name="force_v2_in_keras_compile", default=None,
+        help="Forces the use of run_distribued path even if not"
+             "using a `strategy`. This is not the same as"
+             "`tf.distribute.OneDeviceStrategy`")
 
   return key_flags

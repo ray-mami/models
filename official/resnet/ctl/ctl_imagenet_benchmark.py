@@ -22,7 +22,7 @@ import time
 from absl import flags
 import tensorflow as tf
 
-from official.resnet import imagenet_main
+from official.vision.image_classification import common
 from official.resnet.ctl import ctl_imagenet_main
 from official.resnet.ctl import ctl_common
 from official.utils.testing.perfzero_benchmark import PerfZeroBenchmark
@@ -118,7 +118,7 @@ class Resnet50CtlAccuracy(CtlBenchmark):
 
     flag_methods = [
         ctl_common.define_ctl_flags,
-        lambda: imagenet_main.define_imagenet_flags()
+        common.define_keras_flags
     ]
 
     self.data_dir = os.path.join(root_data_dir, 'imagenet')
@@ -162,7 +162,7 @@ class Resnet50CtlBenchmarkBase(CtlBenchmark):
   def __init__(self, output_dir=None, default_flags=None):
     flag_methods = [
         ctl_common.define_ctl_flags,
-        lambda: imagenet_main.define_imagenet_flags()
+        common.define_keras_flags
     ]
 
     super(Resnet50CtlBenchmarkBase, self).__init__(
@@ -204,6 +204,18 @@ class Resnet50CtlBenchmarkBase(CtlBenchmark):
     FLAGS.distribution_strategy = 'default'
     FLAGS.model_dir = self._get_model_dir('benchmark_1_gpu')
     FLAGS.batch_size = 128
+    self._run_and_report_benchmark()
+
+  def benchmark_1_gpu_eager(self):
+    """Test Keras model with 1 GPU in pure eager mode."""
+    self._setup()
+
+    FLAGS.num_gpus = 1
+    FLAGS.distribution_strategy = 'default'
+    FLAGS.model_dir = self._get_model_dir('benchmark_1_gpu_eager')
+    FLAGS.batch_size = 64
+    FLAGS.use_tf_function = False
+    FLAGS.single_l2_loss_op = True
     self._run_and_report_benchmark()
 
   def benchmark_8_gpu(self):
