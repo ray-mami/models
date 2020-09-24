@@ -1,3 +1,4 @@
+# Lint as: python3
 # Copyright 2019 The TensorFlow Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,21 +14,25 @@
 # limitations under the License.
 # ==============================================================================
 """Transformer-based text encoder network."""
-
+# pylint: disable=g-classes-have-attributes
 from __future__ import absolute_import
 from __future__ import division
 # from __future__ import google_type_annotations
 from __future__ import print_function
 
 import inspect
+
+from absl import logging
+import gin
 import tensorflow as tf
 
-from tensorflow.python.keras.engine import network  # pylint: disable=g-direct-tensorflow-import
+from official.nlp import keras_nlp
 from official.nlp.modeling import layers
 
 
 @tf.keras.utils.register_keras_serializable(package='Text')
-class EncoderScaffold(network.Network):
+@gin.configurable
+class EncoderScaffold(tf.keras.Model):
   """Bi-directional Transformer-based encoder network scaffold.
 
   This network allows users to flexibly implement an encoder similar to the one
@@ -46,14 +51,18 @@ class EncoderScaffold(network.Network):
   If the hidden_cls is not overridden, a default transformer layer will be
   instantiated.
 
-  Attributes:
-    num_output_classes: The output size of the classification layer.
-    classification_layer_initializer: The initializer for the classification
-      layer.
+  *Note* that the network is constructed by
+  [Keras Functional API](https://keras.io/guides/functional_api/).
+
+  Arguments:
+    pooled_output_dim: The dimension of pooled output.
+    pooler_layer_initializer: The initializer for the classification layer.
     embedding_cls: The class or instance to use to embed the input data. This
-      class or instance defines the inputs to this encoder. If embedding_cls is
-      not set, a default embedding network (from the original BERT paper) will
-      be created.
+      class or instance defines the inputs to this encoder and outputs (1)
+      embeddings tensor with shape [batch_size, seq_length, hidden_size] and (2)
+      attention masking with tensor [batch_size, seq_length, seq_length]. If
+      embedding_cls is not set, a default embedding network (from the original
+      BERT paper) will be created.
     embedding_cfg: A dict of kwargs to pass to the embedding_cls, if it needs to
       be instantiated. If embedding_cls is not set, a config dict must be
       passed to 'embedding_cfg' with the following values:
@@ -82,56 +91,57 @@ class EncoderScaffold(network.Network):
         "dropout_rate": The overall dropout rate for the transformer layers.
         "attention_dropout_rate": The dropout rate for the attention layers.
         "kernel_initializer": The initializer for the transformer layers.
+    return_all_layer_outputs: Whether to output sequence embedding outputs of
+      all encoder transformer layers.
+    dict_outputs: Whether to use a dictionary as the model outputs.
   """
 
-  def __init__(
-      self,
-      num_output_classes,
-      classification_layer_initializer=tf.keras.initializers.TruncatedNormal(
-          stddev=0.02),
-      embedding_cls=None,
-      embedding_cfg=None,
-      embedding_data=None,
-      num_hidden_instances=1,
-      hidden_cls=layers.Transformer,
-      hidden_cfg=None,
-      **kwargs):
-    print(embedding_cfg)
+  def __init__(self,
+               pooled_output_dim,
+               pooler_layer_initializer=tf.keras.initializers.TruncatedNormal(
+                   stddev=0.02),
+               embedding_cls=None,
+               embedding_cfg=None,
+               embedding_data=None,
+               num_hidden_instances=1,
+               hidden_cls=layers.Transformer,
+               hidden_cfg=None,
+               return_all_layer_outputs=False,
+               dict_outputs=False,
+               **kwargs):
     self._self_setattr_tracking = False
     self._hidden_cls = hidden_cls
     self._hidden_cfg = hidden_cfg
     self._num_hidden_instances = num_hidden_instances
-    self._num_output_classes = num_output_classes
-    self._classification_layer_initializer = classification_layer_initializer
+    self._pooled_output_dim = pooled_output_dim
+    self._pooler_layer_initializer = pooler_layer_initializer
     self._embedding_cls = embedding_cls
     self._embedding_cfg = embedding_cfg
     self._embedding_data = embedding_data
+    self._return_all_layer_outputs = return_all_layer_outputs
+    self._dict_outputs = dict_outputs
     self._kwargs = kwargs
 
     if embedding_cls:
       if inspect.isclass(embedding_cls):
-        self._embedding_network = embedding_cls(embedding_cfg)
+        self._embedding_network = embedding_cls(
+            **embedding_cfg) if embedding_cfg else embedding_cls()
       else:
         self._embedding_network = embedding_cls
       inputs = self._embedding_network.inputs
-      embeddings, mask = self._embedding_network(inputs)
+      embeddings, attention_mask = self._embedding_network(inputs)
     else:
       self._embedding_network = None
+      seq_length = embedding_cfg.get('seq_length', None)
       word_ids = tf.keras.layers.Input(
-          shape=(embedding_cfg['seq_length'],),
-          dtype=tf.int32,
-          name='input_word_ids')
+          shape=(seq_length,), dtype=tf.int32, name='input_word_ids')
       mask = tf.keras.layers.Input(
-          shape=(embedding_cfg['seq_length'],),
-          dtype=tf.int32,
-          name='input_mask')
+          shape=(seq_length,), dtype=tf.int32, name='input_mask')
       type_ids = tf.keras.layers.Input(
-          shape=(embedding_cfg['seq_length'],),
-          dtype=tf.int32,
-          name='input_type_ids')
+          shape=(seq_length,), dtype=tf.int32, name='input_type_ids')
       inputs = [word_ids, mask, type_ids]
 
-      self._embedding_layer = layers.OnDeviceEmbedding(
+      self._embedding_layer = keras_nlp.layers.OnDeviceEmbedding(
           vocab_size=embedding_cfg['vocab_size'],
           embedding_width=embedding_cfg['hidden_size'],
           initializer=embedding_cfg['initializer'],
@@ -140,69 +150,85 @@ class EncoderScaffold(network.Network):
       word_embeddings = self._embedding_layer(word_ids)
 
       # Always uses dynamic slicing for simplicity.
-      self._position_embedding_layer = layers.PositionEmbedding(
+      self._position_embedding_layer = keras_nlp.layers.PositionEmbedding(
           initializer=embedding_cfg['initializer'],
-          use_dynamic_slicing=True,
-          max_sequence_length=embedding_cfg['max_seq_length'])
+          max_length=embedding_cfg['max_seq_length'],
+          name='position_embedding')
       position_embeddings = self._position_embedding_layer(word_embeddings)
 
-      type_embeddings = (
-          layers.OnDeviceEmbedding(
-              vocab_size=embedding_cfg['type_vocab_size'],
-              embedding_width=embedding_cfg['hidden_size'],
-              initializer=embedding_cfg['initializer'],
-              use_one_hot=True,
-              name='type_embeddings')(type_ids))
+      self._type_embedding_layer = keras_nlp.layers.OnDeviceEmbedding(
+          vocab_size=embedding_cfg['type_vocab_size'],
+          embedding_width=embedding_cfg['hidden_size'],
+          initializer=embedding_cfg['initializer'],
+          use_one_hot=True,
+          name='type_embeddings')
+      type_embeddings = self._type_embedding_layer(type_ids)
 
       embeddings = tf.keras.layers.Add()(
           [word_embeddings, position_embeddings, type_embeddings])
-      embeddings = (
-          tf.keras.layers.LayerNormalization(
-              name='embeddings/layer_norm',
-              axis=-1,
-              epsilon=1e-12,
-              dtype=tf.float32)(embeddings))
+
+      self._embedding_norm_layer = tf.keras.layers.LayerNormalization(
+          name='embeddings/layer_norm',
+          axis=-1,
+          epsilon=1e-12,
+          dtype=tf.float32)
+      embeddings = self._embedding_norm_layer(embeddings)
+
       embeddings = (
           tf.keras.layers.Dropout(
               rate=embedding_cfg['dropout_rate'])(embeddings))
 
-    attention_mask = layers.SelfAttentionMask()([embeddings, mask])
+      attention_mask = layers.SelfAttentionMask()([embeddings, mask])
+
     data = embeddings
 
+    layer_output_data = []
+    self._hidden_layers = []
     for _ in range(num_hidden_instances):
       if inspect.isclass(hidden_cls):
-        layer = self._hidden_cls(**hidden_cfg)
+        layer = hidden_cls(**hidden_cfg) if hidden_cfg else hidden_cls()
       else:
-        layer = self._hidden_cls
+        layer = hidden_cls
       data = layer([data, attention_mask])
+      layer_output_data.append(data)
+      self._hidden_layers.append(layer)
 
     first_token_tensor = (
-        tf.keras.layers.Lambda(lambda x: tf.squeeze(x[:, 0:1, :], axis=1))(data)
-    )
-    cls_output = tf.keras.layers.Dense(
-        units=num_output_classes,
+        tf.keras.layers.Lambda(lambda x: tf.squeeze(x[:, 0:1, :], axis=1))(
+            layer_output_data[-1]))
+    self._pooler_layer = tf.keras.layers.Dense(
+        units=pooled_output_dim,
         activation='tanh',
-        kernel_initializer=classification_layer_initializer,
-        name='cls_transform')(
-            first_token_tensor)
+        kernel_initializer=pooler_layer_initializer,
+        name='cls_transform')
+    cls_output = self._pooler_layer(first_token_tensor)
+
+    if dict_outputs:
+      outputs = dict(
+          sequence_output=layer_output_data[-1],
+          pooled_output=cls_output,
+          encoder_outputs=layer_output_data,
+      )
+    elif return_all_layer_outputs:
+      outputs = [layer_output_data, cls_output]
+    else:
+      outputs = [layer_output_data[-1], cls_output]
 
     super(EncoderScaffold, self).__init__(
-        inputs=inputs, outputs=[data, cls_output], **kwargs)
+        inputs=inputs, outputs=outputs, **kwargs)
+
+    logging.info('EncoderScaffold configs: %s', self.get_config())
 
   def get_config(self):
     config_dict = {
-        'num_hidden_instances':
-            self._num_hidden_instances,
-        'num_output_classes':
-            self._num_output_classes,
-        'classification_layer_initializer':
-            self._classification_layer_initializer,
-        'embedding_cls':
-            self._embedding_network,
-        'embedding_cfg':
-            self._embedding_cfg,
-        'hidden_cfg':
-            self._hidden_cfg,
+        'num_hidden_instances': self._num_hidden_instances,
+        'pooled_output_dim': self._pooled_output_dim,
+        'pooler_layer_initializer': self._pooler_layer_initializer,
+        'embedding_cls': self._embedding_network,
+        'embedding_cfg': self._embedding_cfg,
+        'hidden_cfg': self._hidden_cfg,
+        'return_all_layer_outputs': self._return_all_layer_outputs,
+        'dict_outputs': self._dict_outputs,
     }
     if inspect.isclass(self._hidden_cls):
       config_dict['hidden_cls_string'] = tf.keras.utils.get_registered_name(
@@ -239,3 +265,13 @@ class EncoderScaffold(network.Network):
                           'serialization is not yet supported.') % self.name)
     else:
       return self._embedding_data
+
+  @property
+  def hidden_layers(self):
+    """List of hidden layers in the encoder."""
+    return self._hidden_layers
+
+  @property
+  def pooler_layer(self):
+    """The pooler dense layer after the transformer layers."""
+    return self._pooler_layer

@@ -61,6 +61,7 @@ class TransformerTaskTest(tf.test.TestCase):
     FLAGS.train_steps = 2
     FLAGS.validation_steps = 1
     FLAGS.batch_size = 8
+    FLAGS.max_length = 1
     FLAGS.num_gpus = 1
     FLAGS.distribution_strategy = 'off'
     FLAGS.dtype = 'fp32'
@@ -82,6 +83,13 @@ class TransformerTaskTest(tf.test.TestCase):
   def test_train_no_dist_strat(self):
     if context.num_gpus() >= 2:
       self.skipTest('No need to test 2+ GPUs without a distribution strategy.')
+    t = transformer_main.TransformerTask(FLAGS)
+    t.train()
+
+  def test_train_save_full_model(self):
+    if context.num_gpus() >= 2:
+      self.skipTest('No need to test 2+ GPUs without a distribution strategy.')
+    FLAGS.save_weights_only = False
     t = transformer_main.TransformerTask(FLAGS)
     t.train()
 
@@ -187,5 +195,4 @@ class TransformerTaskTest(tf.test.TestCase):
 
 
 if __name__ == '__main__':
-  tf.compat.v1.enable_v2_behavior()
   tf.test.main()

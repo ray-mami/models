@@ -18,7 +18,7 @@
 from __future__ import absolute_import
 from __future__ import division
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
 from tensorflow.contrib import framework as contrib_framework
 from tensorflow.contrib import layers as contrib_layers
 from tensorflow.python.training import moving_averages
@@ -120,6 +120,8 @@ def quantizable_separable_conv2d(inputs,
                                  stride=1,
                                  activation_fn=tf.nn.relu6,
                                  normalizer_fn=None,
+                                 weights_initializer=None,
+                                 pointwise_initializer=None,
                                  scope=None):
   """Quantization friendly backward compatible separable conv2d.
 
@@ -145,6 +147,8 @@ def quantizable_separable_conv2d(inputs,
     activation_fn: Activation function. The default value is a ReLU function.
       Explicitly set it to None to skip it and maintain a linear activation.
     normalizer_fn: Normalization function to use instead of biases.
+    weights_initializer: An initializer for the depthwise weights.
+    pointwise_initializer: An initializer for the pointwise weights.
     scope: Optional scope for variable_scope.
 
   Returns:
@@ -160,6 +164,8 @@ def quantizable_separable_conv2d(inputs,
         activation_fn=None,
         normalizer_fn=None,
         biases_initializer=None,
+        weights_initializer=weights_initializer,
+        pointwise_initializer=None,
         scope=scope)
     outputs = contrib_layers.bias_add(
         outputs, trainable=True, scope='%s_bias' % scope)
@@ -169,6 +175,7 @@ def quantizable_separable_conv2d(inputs,
         activation_fn=activation_fn,
         stride=stride,
         normalizer_fn=normalizer_fn,
+        weights_initializer=pointwise_initializer,
         scope=scope)
   else:
     outputs = contrib_layers.separable_conv2d(
@@ -179,6 +186,8 @@ def quantizable_separable_conv2d(inputs,
         stride=stride,
         activation_fn=activation_fn,
         normalizer_fn=normalizer_fn,
+        weights_initializer=weights_initializer,
+        pointwise_initializer=pointwise_initializer,
         scope=scope)
   return outputs
 
@@ -204,19 +213,45 @@ def quantize_op(inputs,
   Returns:
     Tensor resulting from quantizing the input tensors.
   """
-  if is_quantized:
-    with tf.variable_scope(scope):
-      min_var = _quant_var('min', default_min)
-      max_var = _quant_var('max', default_max)
-      if is_training:
-        # TFLite requires that 0.0 is always in the [min; max] range.
-        range_min = tf.minimum(tf.reduce_min(inputs), 0.0, 'SafeQuantRangeMin')
-        range_max = tf.maximum(tf.reduce_max(inputs), 0.0, 'SafeQuantRangeMax')
-        min_val = moving_averages.assign_moving_average(
-            min_var, range_min, ema_decay, name='AssignMinEma')
-        max_val = moving_averages.assign_moving_average(
-            max_var, range_max, ema_decay, name='AssignMaxEma')
-        inputs = tf.fake_quant_with_min_max_vars(inputs, min_val, max_val)
-      else:
-        inputs = tf.fake_quant_with_min_max_vars(inputs, min_var, max_var)
-  return inputs
+  if not is_quantized:
+    return inputs
+
+  with tf.variable_scope(scope):
+    min_var = _quant_var('min', default_min)
+    max_var = _quant_var('max', default_max)
+    if not is_training:
+      # Just use variables in the checkpoint.
+      return tf.fake_quant_with_min_max_vars(inputs, min_var, max_var)
+
+    # While training, collect EMAs of ranges seen, store in min_var, max_var.
+    # TFLite requires that 0.0 is always in the [min; max] range.
+    range_min = tf.minimum(tf.reduce_min(inputs), 0.0, 'SafeQuantRangeMin')
+    # We set the lower_bound of max_range to prevent range collapse.
+    range_max = tf.maximum(tf.reduce_max(inputs), 1e-5, 'SafeQuantRangeMax')
+    min_val = moving_averages.assign_moving_average(
+        min_var, range_min, ema_decay, name='AssignMinEma')
+    max_val = moving_averages.assign_moving_average(
+        max_var, range_max, ema_decay, name='AssignMaxEma')
+    return tf.fake_quant_with_min_max_vars(inputs, min_val, max_val)
+
+
+def fixed_quantize_op(inputs, is_quantized=True,
+                      fixed_min=0.0, fixed_max=6.0, scope='quant'):
+  """Inserts a fake quantization op with fixed range after inputs.
+
+  Args:
+    inputs: A tensor of size [batch_size, height, width, channels].
+    is_quantized: flag to enable/disable quantization.
+    fixed_min: fixed min value for fake quant op.
+    fixed_max: fixed max value for fake quant op.
+    scope: Optional scope for variable_scope.
+
+  Returns:
+    Tensor resulting from quantizing the input tensors.
+  """
+  if not is_quantized:
+    return inputs
+
+  with tf.variable_scope(scope):
+    # Just use fixed quantization range.
+    return tf.fake_quant_with_min_max_args(inputs, fixed_min, fixed_max)

@@ -318,7 +318,7 @@ class BasicTokenizer(object):
 class WordpieceTokenizer(object):
   """Runs WordPiece tokenziation."""
 
-  def __init__(self, vocab, unk_token="[UNK]", max_input_chars_per_word=200):
+  def __init__(self, vocab, unk_token="[UNK]", max_input_chars_per_word=400):
     self.vocab = vocab
     self.unk_token = unk_token
     self.max_input_chars_per_word = max_input_chars_per_word
@@ -421,7 +421,7 @@ def preprocess_text(inputs, remove_space=True, lower=False):
   """Preprocesses data by removing extra space and normalize data.
 
   This method is used together with sentence piece tokenizer and is forked from:
-  https://github.com/google-research/google-research/blob/master/albert/tokenization.py
+  https://github.com/google-research/google-research/blob/e1f6fa00/albert/tokenization.py
 
   Args:
     inputs: The input text.
@@ -454,7 +454,7 @@ def encode_pieces(sp_model, text, sample=False):
   """Segements text into pieces.
 
   This method is used together with sentence piece tokenizer and is forked from:
-  https://github.com/google-research/google-research/blob/master/albert/tokenization.py
+  https://github.com/google-research/google-research/blob/e1f6fa00/albert/tokenization.py
 
 
   Args:
@@ -496,7 +496,7 @@ def encode_ids(sp_model, text, sample=False):
   """Segments text and return token ids.
 
   This method is used together with sentence piece tokenizer and is forked from:
-  https://github.com/google-research/google-research/blob/master/albert/tokenization.py
+  https://github.com/google-research/google-research/blob/e1f6fa00/albert/tokenization.py
 
   Args:
     sp_model: A spm.SentencePieceProcessor object.

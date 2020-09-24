@@ -20,10 +20,26 @@ from __future__ import division
 from __future__ import print_function
 
 import numpy as np
-import tensorflow.compat.v2 as tf
+import tensorflow as tf
 
 EPSILON = 1e-8
 BBOX_XFORM_CLIP = np.log(1000. / 16.)
+
+
+def visualize_images_with_bounding_boxes(images, box_outputs, step,
+                                         summary_writer):
+  """Records subset of evaluation images with bounding boxes."""
+  image_shape = tf.shape(images[0])
+  image_height = tf.cast(image_shape[0], tf.float32)
+  image_width = tf.cast(image_shape[1], tf.float32)
+  normalized_boxes = normalize_boxes(box_outputs, [image_height, image_width])
+
+  bounding_box_color = tf.constant([[1.0, 1.0, 0.0, 1.0]])
+  image_summary = tf.image.draw_bounding_boxes(images, normalized_boxes,
+                                               bounding_box_color)
+  with summary_writer.as_default():
+    tf.summary.image('bounding_box_summary', image_summary, step=step)
+    summary_writer.flush()
 
 
 def yxyx_to_xywh(boxes):
@@ -99,8 +115,8 @@ def normalize_boxes(boxes, image_shape):
   """Converts boxes to the normalized coordinates.
 
   Args:
-    boxes: a tensor whose last dimension is 4 representing the coordinates
-      of boxes in ymin, xmin, ymax, xmax order.
+    boxes: a tensor whose last dimension is 4 representing the coordinates of
+      boxes in ymin, xmin, ymax, xmax order.
     image_shape: a list of two integers, a two-element vector or a tensor such
       that all but the last dimensions are `broadcastable` to `boxes`. The last
       dimension is 2, which represents [height, width].
@@ -137,8 +153,8 @@ def denormalize_boxes(boxes, image_shape):
   """Converts boxes normalized by [height, width] to pixel coordinates.
 
   Args:
-    boxes: a tensor whose last dimension is 4 representing the coordinates
-      of boxes in ymin, xmin, ymax, xmax order.
+    boxes: a tensor whose last dimension is 4 representing the coordinates of
+      boxes in ymin, xmin, ymax, xmax order.
     image_shape: a list of two integers, a two-element vector or a tensor such
       that all but the last dimensions are `broadcastable` to `boxes`. The last
       dimension is 2, which represents [height, width].
@@ -171,8 +187,8 @@ def clip_boxes(boxes, image_shape):
   """Clips boxes to image boundaries.
 
   Args:
-    boxes: a tensor whose last dimension is 4 representing the coordinates
-      of boxes in ymin, xmin, ymax, xmax order.
+    boxes: a tensor whose last dimension is 4 representing the coordinates of
+      boxes in ymin, xmin, ymax, xmax order.
     image_shape: a list of two integers, a two-element vector or a tensor such
       that all but the last dimensions are `broadcastable` to `boxes`. The last
       dimension is 2, which represents [height, width].
@@ -239,8 +255,8 @@ def encode_boxes(boxes, anchors, weights=None):
   """Encode boxes to targets.
 
   Args:
-    boxes: a tensor whose last dimension is 4 representing the coordinates
-      of boxes in ymin, xmin, ymax, xmax order.
+    boxes: a tensor whose last dimension is 4 representing the coordinates of
+      boxes in ymin, xmin, ymax, xmax order.
     anchors: a tensor whose shape is the same as, or `broadcastable` to `boxes`,
       representing the coordinates of anchors in ymin, xmin, ymax, xmax order.
     weights: None or a list of four float numbers used to scale coordinates.
@@ -286,9 +302,8 @@ def encode_boxes(boxes, anchors, weights=None):
       encoded_dh *= weights[2]
       encoded_dw *= weights[3]
 
-    encoded_boxes = tf.concat(
-        [encoded_dy, encoded_dx, encoded_dh, encoded_dw],
-        axis=-1)
+    encoded_boxes = tf.concat([encoded_dy, encoded_dx, encoded_dh, encoded_dw],
+                              axis=-1)
     return encoded_boxes
 
 
@@ -343,10 +358,11 @@ def decode_boxes(encoded_boxes, anchors, weights=None):
     decoded_boxes_ymax = decoded_boxes_ymin + decoded_boxes_h - 1.0
     decoded_boxes_xmax = decoded_boxes_xmin + decoded_boxes_w - 1.0
 
-    decoded_boxes = tf.concat(
-        [decoded_boxes_ymin, decoded_boxes_xmin,
-         decoded_boxes_ymax, decoded_boxes_xmax],
-        axis=-1)
+    decoded_boxes = tf.concat([
+        decoded_boxes_ymin, decoded_boxes_xmin, decoded_boxes_ymax,
+        decoded_boxes_xmax
+    ],
+                              axis=-1)
     return decoded_boxes
 
 
@@ -530,6 +546,6 @@ def get_non_empty_box_indices(boxes):
   # Selects indices if box height or width is 0.
   height = boxes[:, 2] - boxes[:, 0]
   width = boxes[:, 3] - boxes[:, 1]
-  indices = tf.where(tf.logical_and(tf.greater(height, 0),
-                                    tf.greater(width, 0)))
+  indices = tf.where(
+      tf.logical_and(tf.greater(height, 0), tf.greater(width, 0)))
   return indices[:, 0]
